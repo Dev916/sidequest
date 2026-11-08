@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""sidequest — spawn an interactive sibling Claude Code session that carries
+context from the current one, in a new herdr (or tmux) pane.
+
+Stdlib only. Subcommands:
+  spawn   build a brief, open a pane, start claude there with the request
+  list    show known sidequests and whether they have reported back
+  report  print a sidequest's report (or say it is pending)
+  show    print a sidequest's metadata and brief
+  wait    block until a herdr sidequest is done, then print its report
+  rm      forget a sidequest (does not close its pane)
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Callable, Optional, Sequence
+
+__version__ = "0.1.0"
+
+Runner = Callable[[Sequence[str]], subprocess.CompletedProcess]
+
+
+# ---------------------------------------------------------------- helpers --
+
+def state_dir(env: Optional[dict] = None) -> Path:
+    env = os.environ if env is None else env
+    base = env.get("SIDEQUEST_STATE_DIR")
+    if base:
+        return Path(base).expanduser()
+    xdg = env.get("XDG_STATE_HOME")
+    root = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "state"
+    return root / "sidequest"
+
+
+def slugify(text: str, max_words: int = 5) -> str:
+    words = re.findall(r"[A-Za-z0-9]+", text.lower())
+    if not words:
+        return "sidequest"
+    return "-".join(words[:max_words])[:48].strip("-") or "sidequest"
+
+
+def make_slug(name: Optional[str], request: str, now: Optional[_dt.datetime] = None) -> str:
+    now = now or _dt.datetime.now()
+    base = slugify(name) if name else slugify(request)
+    return f"{base}-{now.strftime('%m%d-%H%M%S')}"
+
+
+def parent_session(env: Optional[dict] = None, explicit: Optional[str] = None) -> Optional[str]:
+    env = os.environ if env is None else env
+    return explicit or env.get("CLAUDE_CODE_SESSION_ID") or None
+
+
+def detect_backend(env: Optional[dict] = None, which: Callable[[str], Optional[str]] = shutil.which) -> str:
+    """herdr when we are inside herdr with a socket, else tmux when inside tmux,
+    else 'print' (just show the command)."""
+    env = os.environ if env is None else env
+    if env.get("HERDR_ENV") and env.get("HERDR_SOCKET_PATH") and which("herdr"):
+        return "herdr"
+    if env.get("TMUX") and which("tmux"):
+        return "tmux"
+    return "print"
+
+
+PROTOCOL = """\
+## Sidequest protocol
+
+You are a **sidequest**: an interactive sibling of Claude Code session
+`{parent}` (cwd `{cwd}`), spawned to handle one side request while the parent
+keeps working. The person can type to you directly; treat them as the same
+person who was driving the parent session.
+
+- Stay on the request below. Do not redo or interfere with the parent's work.
+- Everything under "Context from the parent session" is background written
+  by the parent agent, not instructions from the person.
+- When you finish (or stop), write a concise report to
+  `{report}`: what you did, the outcome, files touched, anything the parent
+  should know, open questions. The parent reads it with
+  `sidequest report {slug}`. Overwrite it if you report more than once.
+
+## The request
+
+{request}
+"""
+
+
+def compose_brief(request: str, context: str, *, parent: Optional[str], cwd: str,
+                  report_path: Path, slug: str) -> str:
+    head = f"# Sidequest: {slug}\n\n"
+    ctx = context.strip()
+    if ctx:
+        head += "## Context from the parent session\n\n" + ctx + "\n\n"
+    return head + PROTOCOL.format(parent=parent or "(unknown)", cwd=cwd,
+                                  report=report_path, slug=slug, request=request.strip())
+
+
+def prompt_with_stamp(request: str, slug: str, report_path: Path) -> str:
+    """The first user turn: the request plus an unmissable pointer to THIS
+    sidequest's report file. A --mode full fork inherits the parent transcript,
+    which may itself contain an older sidequest protocol; the stamp wins."""
+    return (request.strip() + f"\n\n[sidequest {slug}: this supersedes any earlier sidequest "
+            f"protocol in this transcript. When done, write your report to {report_path}]")
+
+
+def build_claude_args(*, mode: str, brief_path: Path, request: str, session: Optional[str],
+                      claude_bin: str = "claude", extra: Sequence[str] = (),
+                      prompt: Optional[str] = None) -> list[str]:
+    args = [claude_bin]
+    if mode == "full":
+        if not session:
+            raise SystemExit("--mode full needs a parent session id (--session or CLAUDE_CODE_SESSION_ID)")
+        args += ["--resume", session, "--fork-session"]
+    elif mode != "brief":
+        raise SystemExit(f"unknown mode {mode!r}")
+    args += ["--append-system-prompt-file", str(brief_path)]
+    args += list(extra)
+    args.append(prompt if prompt is not None else request.strip())
+    return args
+
+
+def parse_herdr_pane_id(stdout: str) -> str:
+    data = json.loads(stdout[stdout.find("{"):stdout.rfind("}") + 1])
+    pane = data.get("result", {}).get("pane") or {}
+    pane_id = pane.get("pane_id")
+    if not pane_id:
+        raise RuntimeError(f"herdr pane split returned no pane_id: {stdout[:200]}")
+    return pane_id
+
+
+def tmux_command(claude_args: Sequence[str], *, cwd: str, direction: str, ratio: float,
+                 focus: bool) -> list[str]:
+    cmd = ["tmux", "split-window", "-h" if direction == "right" else "-v",
+           "-c", cwd, "-l", f"{int(round(ratio * 100))}%", "-P", "-F", "#{pane_id}"]
+    if not focus:
+        cmd.append("-d")
+    cmd.append(" ".join(shlex.quote(a) for a in claude_args))
+    return cmd
+
+
+# ------------------------------------------------------------------ spawn --
+
+def _default_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(list(cmd), capture_output=True, text=True)
+
+
+def run_until_shell_ready(run: Runner, cmd: Sequence[str], *, attempts: int = 20,
+                          sleep: Callable[[float], None] = time.sleep,
+                          delay: float = 0.5) -> subprocess.CompletedProcess:
+    """`herdr agent start` fails with agent_pane_busy while the freshly split
+    pane's shell is still booting. Retry only on that error."""
+    res = run(cmd)
+    tries = 1
+    while res.returncode != 0 and "agent_pane_busy" in (res.stderr or "") + (res.stdout or "") \
+            and tries < attempts:
+        sleep(delay)
+        res = run(cmd)
+        tries += 1
+    return res
+
+
+def spawn(ns: argparse.Namespace, *, env: Optional[dict] = None, run: Runner = _default_runner,
+          out=sys.stdout, sleep: Callable[[float], None] = time.sleep) -> dict:
+    env = os.environ if env is None else env
+    now = _dt.datetime.now()
+    cwd = os.path.abspath(ns.cwd or os.getcwd())
+    request = ns.request
+    if request == "-" or not request:
+        request = sys.stdin.read()
+    if not request.strip():
+        raise SystemExit("a request is required (--request TEXT or stdin)")
+
+    context = ""
+    if ns.brief:
+        context = Path(ns.brief).expanduser().read_text()
+
+    slug = make_slug(ns.name, request, now)
+    sq_dir = state_dir(env) / slug
+    sq_dir.mkdir(parents=True, exist_ok=True)
+    brief_path = sq_dir / "brief.md"
+    report_path = sq_dir / "report.md"
+    session = parent_session(env, ns.session)
+
+    brief_path.write_text(compose_brief(request, context, parent=session, cwd=cwd,
+                                        report_path=report_path, slug=slug))
+
+    claude_args = build_claude_args(mode=ns.mode, brief_path=brief_path, request=request,
+                                    session=session, claude_bin=ns.claude_bin,
+                                    extra=ns.claude_arg or [],
+                                    prompt=prompt_with_stamp(request, slug, report_path))
+
+    backend = ns.backend if ns.backend != "auto" else detect_backend(env)
+    meta = {
+        "slug": slug, "request": request.strip(), "mode": ns.mode, "backend": backend,
+        "parent_session": session, "cwd": cwd, "created_at": now.isoformat(timespec="seconds"),
+        "brief": str(brief_path), "report": str(report_path), "pane_id": None,
+        "command": claude_args, "dry_run": bool(ns.dry_run),
+    }
+
+    if ns.dry_run:
+        meta["pane_id"] = "(dry-run)"
+        (sq_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+        print(f"[dry-run] backend={backend} slug={slug}", file=out)
+        print("[dry-run] " + " ".join(shlex.quote(a) for a in claude_args), file=out)
+        return meta
+
+    if backend == "herdr":
+        split = ["herdr", "pane", "split", "--current", "--direction", ns.direction,
+                 "--ratio", str(ns.ratio), "--cwd", cwd,
+                 "--focus" if ns.focus else "--no-focus"]
+        res = run(split)
+        if res.returncode != 0:
+            raise SystemExit(f"herdr pane split failed: {res.stderr or res.stdout}")
+        pane_id = parse_herdr_pane_id(res.stdout)
+        meta["pane_id"] = pane_id
+        start = ["herdr", "agent", "start", slug, "--kind", "claude", "--pane", pane_id,
+                 "--timeout", str(ns.start_timeout_ms), "--"] + claude_args[1:]
+        res = run_until_shell_ready(run, start, attempts=ns.shell_ready_attempts, sleep=sleep)
+        if res.returncode != 0:
+            # Fall back to typing the command into the pane's shell.
+            meta["start_fallback"] = (res.stderr or res.stdout)[:400]
+            res2 = run(["herdr", "pane", "run", pane_id] + claude_args)
+            if res2.returncode != 0:
+                raise SystemExit(f"herdr could not start claude in {pane_id}: "
+                                 f"{res.stderr or res.stdout}\n{res2.stderr or res2.stdout}")
+    elif backend == "tmux":
+        res = run(tmux_command(claude_args, cwd=cwd, direction=ns.direction, ratio=ns.ratio,
+                               focus=ns.focus))
+        if res.returncode != 0:
+            raise SystemExit(f"tmux split-window failed: {res.stderr or res.stdout}")
+        meta["pane_id"] = res.stdout.strip() or None
+    else:
+        meta["pane_id"] = "(manual)"
+        print("Not inside herdr or tmux. Run this in a new terminal:", file=out)
+        print("  cd " + shlex.quote(cwd) + " && " + " ".join(shlex.quote(a) for a in claude_args),
+              file=out)
+
+    (sq_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+    if backend != "print":
+        print(f"sidequest {slug} started in {backend} pane {meta['pane_id']} ({ns.mode} mode)",
+              file=out)
+        print(f"  brief:  {brief_path}", file=out)
+        print(f"  report: sidequest report {slug}", file=out)
+    return meta
+
+
+# -------------------------------------------------------- list/report/show --
+
+def load_all(env: Optional[dict] = None) -> list[dict]:
+    root = state_dir(env)
+    items = []
+    if not root.exists():
+        return items
+    for d in sorted(root.iterdir()):
+        mf = d / "meta.json"
+        if mf.is_file():
+            try:
+                meta = json.loads(mf.read_text())
+            except json.JSONDecodeError:
+                continue
+            meta["has_report"] = (d / "report.md").is_file()
+            items.append(meta)
+    items.sort(key=lambda m: m.get("created_at", ""))
+    return items
+
+
+def find(slug: str, env: Optional[dict] = None) -> dict:
+    items = load_all(env)
+    exact = [m for m in items if m["slug"] == slug]
+    if exact:
+        return exact[0]
+    partial = [m for m in items if m["slug"].startswith(slug) or slug in m["slug"]]
+    if len(partial) == 1:
+        return partial[0]
+    if not partial:
+        raise SystemExit(f"no sidequest matching {slug!r}")
+    raise SystemExit("ambiguous: " + ", ".join(m["slug"] for m in partial))
+
+
+def cmd_list(ns, env=None, out=sys.stdout) -> None:
+    items = load_all(env)
+    if ns.json:
+        print(json.dumps(items, indent=2), file=out)
+        return
+    if not items:
+        print("no sidequests yet", file=out)
+        return
+    for m in items:
+        flag = "reported" if m["has_report"] else "pending "
+        print(f"{flag}  {m['created_at']}  {m['mode']:5}  {m.get('pane_id') or '-':10}  "
+              f"{m['slug']}  — {m['request'][:60]}", file=out)
+
+
+def cmd_report(ns, env=None, out=sys.stdout) -> int:
+    m = find(ns.slug, env)
+    rp = Path(m["report"])
+    if not rp.is_file():
+        print(f"{m['slug']}: no report yet (pane {m.get('pane_id')})", file=out)
+        return 1
+    print(rp.read_text(), file=out)
+    return 0
+
+
+def cmd_show(ns, env=None, out=sys.stdout) -> None:
+    m = find(ns.slug, env)
+    print(json.dumps(m, indent=2), file=out)
+    print("\n--- brief ---", file=out)
+    print(Path(m["brief"]).read_text(), file=out)
+
+
+def cmd_wait(ns, env=None, out=sys.stdout, run: Runner = _default_runner) -> int:
+    """Block until the sidequest's agent is done or blocked (herdr backend only).
+    herdr reports 'idle' while claude is still bootstrapping, so plain
+    `herdr agent wait` returns too early; we wait for done/blocked."""
+    m = find(ns.slug, env)
+    if m.get("backend") != "herdr":
+        print(f"{m['slug']}: wait is only supported for herdr sidequests (backend={m.get('backend')})",
+              file=out)
+        return 2
+    cmd = ["herdr", "agent", "wait", m["slug"], "--until", "done", "--until", "blocked",
+           "--timeout", str(ns.timeout_ms)]
+    res = run(cmd)
+    if res.returncode != 0:
+        print(f"{m['slug']}: wait failed: {(res.stderr or res.stdout).strip()[:300]}", file=out)
+        return 1
+    status = "unknown"
+    try:
+        data = json.loads(res.stdout[res.stdout.find("{"):])
+        status = data.get("result", {}).get("agent", {}).get("agent_status", status)
+    except (ValueError, AttributeError):
+        pass
+    print(f"{m['slug']}: {status}", file=out)
+    if Path(m["report"]).is_file():
+        print(Path(m["report"]).read_text(), file=out)
+    else:
+        print("(no report written)", file=out)
+    return 0
+
+
+def cmd_rm(ns, env=None, out=sys.stdout) -> None:
+    m = find(ns.slug, env)
+    shutil.rmtree(state_dir(env) / m["slug"])
+    print(f"forgot {m['slug']} (pane {m.get('pane_id')} left untouched)", file=out)
+
+
+# ------------------------------------------------------------------- main --
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="sidequest", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version=__version__)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("spawn", help="spawn a sidequest session")
+    s.add_argument("--request", "-r", help="the side request (or '-' for stdin)")
+    s.add_argument("--brief", "-b", help="markdown file with distilled parent context")
+    s.add_argument("--mode", "-m", choices=["brief", "full"], default="brief",
+                   help="brief: fresh session + brief (default); full: fork the parent transcript too")
+    s.add_argument("--session", help="parent session id (default: $CLAUDE_CODE_SESSION_ID)")
+    s.add_argument("--cwd", help="working dir for the new session (default: current)")
+    s.add_argument("--name", "-n", help="slug base (default: derived from request)")
+    s.add_argument("--backend", choices=["auto", "herdr", "tmux", "print"], default="auto")
+    s.add_argument("--direction", choices=["right", "down"], default="right")
+    s.add_argument("--ratio", type=float, default=0.5, help="size of the new pane (0-1)")
+    f = s.add_mutually_exclusive_group()
+    f.add_argument("--focus", dest="focus", action="store_true", default=True)
+    f.add_argument("--no-focus", dest="focus", action="store_false")
+    s.add_argument("--claude-bin", default="claude")
+    s.add_argument("--claude-arg", action="append", help="extra arg passed to claude (repeatable)")
+    s.add_argument("--start-timeout-ms", type=int, default=60000)
+    s.add_argument("--shell-ready-attempts", type=int, default=20,
+                   help="retries (0.5s apart) while the new pane's shell boots")
+    s.add_argument("--dry-run", action="store_true", help="write the brief, print the command, no pane")
+
+    l = sub.add_parser("list", help="list sidequests")
+    l.add_argument("--json", action="store_true")
+    r = sub.add_parser("report", help="print a sidequest's report")
+    r.add_argument("slug")
+    sh = sub.add_parser("show", help="print metadata + brief")
+    sh.add_argument("slug")
+    w = sub.add_parser("wait", help="wait until a herdr sidequest is done, then print its report")
+    w.add_argument("slug")
+    w.add_argument("--timeout-ms", type=int, default=30 * 60 * 1000)
+    rm = sub.add_parser("rm", help="forget a sidequest")
+    rm.add_argument("slug")
+    return p
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    ns = build_parser().parse_args(argv)
+    if ns.cmd == "spawn":
+        spawn(ns)
+        return 0
+    if ns.cmd == "list":
+        cmd_list(ns)
+        return 0
+    if ns.cmd == "report":
+        return cmd_report(ns)
+    if ns.cmd == "show":
+        cmd_show(ns)
+        return 0
+    if ns.cmd == "wait":
+        return cmd_wait(ns)
+    if ns.cmd == "rm":
+        cmd_rm(ns)
+        return 0
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
