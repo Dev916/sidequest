@@ -167,6 +167,35 @@ def run_until_shell_ready(run: Runner, cmd: Sequence[str], *, attempts: int = 20
     return res
 
 
+def deliver_prompt(run: Runner, slug: str, prompt: str, *, sleep: Callable[[float], None] = time.sleep,
+                   attempts: int = 2, wait_ms: int = 20000) -> dict:
+    """Hand the prompt to a freshly started claude and make sure it was taken.
+
+    Right after `herdr agent start` claude is sometimes still bootstrapping and
+    a pasted prompt lands unsubmitted (or is dropped). `agent prompt --wait
+    --until working` tells us whether a turn actually began. On a stall, press
+    Enter in case the text is sitting in the input box; if that does not start
+    a turn, paste the prompt again."""
+    log = []
+    for i in range(1, attempts + 1):
+        res = run(["herdr", "agent", "prompt", slug, prompt, "--wait", "--until", "working",
+                   "--timeout", str(wait_ms)])
+        if res.returncode == 0:
+            return {"verified": True, "attempts": i, "log": log}
+        err = ((res.stderr or "") + (res.stdout or "")).strip()
+        log.append(f"prompt#{i}: {err[:200]}")
+        if "agent_prompt_stalled" in err or "timeout" in err:
+            run(["herdr", "agent", "send-keys", slug, "enter"])
+            res2 = run(["herdr", "agent", "wait", slug, "--until", "working", "--timeout", "8000"])
+            if res2.returncode == 0:
+                log.append(f"prompt#{i}: enter rescued it")
+                return {"verified": True, "attempts": i, "log": log}
+            sleep(2.0)
+            continue
+        break  # a real error, not a stall
+    return {"verified": False, "attempts": attempts, "log": log}
+
+
 def spawn(ns: argparse.Namespace, *, env: Optional[dict] = None, run: Runner = _default_runner,
           out=sys.stdout, sleep: Callable[[float], None] = time.sleep) -> dict:
     env = os.environ if env is None else env
@@ -230,10 +259,12 @@ def spawn(ns: argparse.Namespace, *, env: Optional[dict] = None, run: Runner = _
         res = run_until_shell_ready(run, start, attempts=ns.shell_ready_attempts, sleep=sleep)
         if res.returncode == 0:
             meta["agent_registered"] = True
-            res = run(["herdr", "agent", "prompt", slug, prompt])
-            if res.returncode != 0:
-                raise SystemExit(f"claude started in {pane_id} but the prompt was not delivered: "
-                                 f"{res.stderr or res.stdout}\nType it yourself: {prompt}")
+            delivery = deliver_prompt(run, slug, prompt, sleep=sleep)
+            meta["prompt_delivery"] = delivery
+            if not delivery["verified"]:
+                print(f"warning: claude started in {pane_id} but did not start working on the "
+                      f"prompt. Check the pane; you may need to press Enter or paste it yourself.",
+                      file=out)
         else:
             # Fall back to typing the whole command into the pane's shell.
             meta["agent_registered"] = False

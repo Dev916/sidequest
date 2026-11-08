@@ -156,16 +156,59 @@ class SpawnFlow(unittest.TestCase):
         self.assertEqual(prompt[:4], ["herdr", "agent", "prompt", meta["slug"]])
         self.assertTrue(prompt[4].startswith("look into the flaky login test\n\n[sidequest "))
         self.assertIn(meta["report"], prompt[4])
+        self.assertEqual(prompt[5:], ["--wait", "--until", "working", "--timeout", "20000"])
+        self.assertTrue(meta["prompt_delivery"]["verified"])
+        self.assertEqual(meta["prompt_delivery"]["attempts"], 1)
         self.assertNotIn("start_fallback", meta)
 
-    def test_herdr_prompt_delivery_failure_exits(self):
+    def test_herdr_prompt_stall_rescued_by_enter(self):
+        stalled = '{"error":{"code":"agent_prompt_stalled"}}'
+        runner = FakeRunner([
+            (0, '{"result":{"pane":{"pane_id":"w8:pZ"}}}', ""),
+            (0, "", ""),                 # agent start
+            (1, stalled, ""),            # prompt --wait stalls
+            (0, "", ""),                 # send-keys enter
+            (0, '{"result":{"agent":{"agent_status":"working"}}}', ""),  # agent wait working
+        ])
+        meta = sq.spawn(ns(cwd="/w"), env=self.env, run=runner, out=StringIO(), sleep=lambda s: None)
+        self.assertEqual(runner.calls[3], ["herdr", "agent", "send-keys", meta["slug"], "enter"])
+        self.assertEqual(runner.calls[4][:4], ["herdr", "agent", "wait", meta["slug"]])
+        self.assertTrue(meta["prompt_delivery"]["verified"])
+        self.assertIn("enter rescued it", " ".join(meta["prompt_delivery"]["log"]))
+
+    def test_herdr_prompt_stall_then_repaste(self):
+        stalled = '{"error":{"code":"agent_prompt_stalled"}}'
         runner = FakeRunner([
             (0, '{"result":{"pane":{"pane_id":"w8:pZ"}}}', ""),
             (0, "", ""),
-            (1, "", "paste failed"),
+            (1, stalled, ""), (0, "", ""), (1, '{"error":{"code":"timeout"}}', ""),  # stall, enter, still not
+            (0, "", ""),                 # second prompt --wait succeeds
         ])
-        with self.assertRaises(SystemExit):
-            sq.spawn(ns(cwd="/w"), env=self.env, run=runner, out=StringIO())
+        meta = sq.spawn(ns(cwd="/w"), env=self.env, run=runner, out=StringIO(), sleep=lambda s: None)
+        self.assertEqual(runner.calls[5][:3], ["herdr", "agent", "prompt"])
+        self.assertTrue(meta["prompt_delivery"]["verified"])
+        self.assertEqual(meta["prompt_delivery"]["attempts"], 2)
+
+    def test_herdr_prompt_never_verified_warns_but_does_not_exit(self):
+        stalled = '{"error":{"code":"agent_prompt_stalled"}}'
+        runner = FakeRunner([
+            (0, '{"result":{"pane":{"pane_id":"w8:pZ"}}}', ""), (0, "", ""),
+            (1, stalled, ""), (0, "", ""), (1, "timeout", ""),
+            (1, stalled, ""), (0, "", ""), (1, "timeout", ""),
+        ])
+        out = StringIO()
+        meta = sq.spawn(ns(cwd="/w"), env=self.env, run=runner, out=out, sleep=lambda s: None)
+        self.assertFalse(meta["prompt_delivery"]["verified"])
+        self.assertIn("warning", out.getvalue())
+
+    def test_herdr_prompt_real_error_stops_retrying(self):
+        runner = FakeRunner([
+            (0, '{"result":{"pane":{"pane_id":"w8:pZ"}}}', ""), (0, "", ""),
+            (1, '{"error":{"code":"agent_not_found"}}', ""),
+        ])
+        meta = sq.spawn(ns(cwd="/w"), env=self.env, run=runner, out=StringIO(), sleep=lambda s: None)
+        self.assertEqual(len(runner.calls), 3)
+        self.assertFalse(meta["prompt_delivery"]["verified"])
 
     def test_herdr_agent_start_failure_falls_back_to_pane_run(self):
         runner = FakeRunner([
