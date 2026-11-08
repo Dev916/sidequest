@@ -221,11 +221,22 @@ def spawn(ns: argparse.Namespace, *, env: Optional[dict] = None, run: Runner = _
             raise SystemExit(f"herdr pane split failed: {res.stderr or res.stdout}")
         pane_id = parse_herdr_pane_id(res.stdout)
         meta["pane_id"] = pane_id
+        # Start claude with FLAGS ONLY (herdr refuses multi-line argv), then hand
+        # the prompt over with `herdr agent prompt`, which pastes multi-line text.
+        flags = claude_args[1:-1]
+        prompt = claude_args[-1]
         start = ["herdr", "agent", "start", slug, "--kind", "claude", "--pane", pane_id,
-                 "--timeout", str(ns.start_timeout_ms), "--"] + claude_args[1:]
+                 "--timeout", str(ns.start_timeout_ms), "--"] + flags
         res = run_until_shell_ready(run, start, attempts=ns.shell_ready_attempts, sleep=sleep)
-        if res.returncode != 0:
-            # Fall back to typing the command into the pane's shell.
+        if res.returncode == 0:
+            meta["agent_registered"] = True
+            res = run(["herdr", "agent", "prompt", slug, prompt])
+            if res.returncode != 0:
+                raise SystemExit(f"claude started in {pane_id} but the prompt was not delivered: "
+                                 f"{res.stderr or res.stdout}\nType it yourself: {prompt}")
+        else:
+            # Fall back to typing the whole command into the pane's shell.
+            meta["agent_registered"] = False
             meta["start_fallback"] = (res.stderr or res.stdout)[:400]
             res2 = run(["herdr", "pane", "run", pane_id] + claude_args)
             if res2.returncode != 0:
@@ -316,30 +327,39 @@ def cmd_show(ns, env=None, out=sys.stdout) -> None:
     print(Path(m["brief"]).read_text(), file=out)
 
 
-def cmd_wait(ns, env=None, out=sys.stdout, run: Runner = _default_runner) -> int:
-    """Block until the sidequest's agent is done or blocked (herdr backend only).
-    herdr reports 'idle' while claude is still bootstrapping, so plain
-    `herdr agent wait` returns too early; we wait for done/blocked."""
+def cmd_wait(ns, env=None, out=sys.stdout, run: Runner = _default_runner,
+             sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic) -> int:
+    """Block until the sidequest is done, then print its report.
+
+    herdr sidequests whose agent registered by name: `herdr agent wait --until
+    done --until blocked` (plain idle fires while claude is still booting).
+    Anything else: poll for report.md until the timeout."""
     m = find(ns.slug, env)
-    if m.get("backend") != "herdr":
-        print(f"{m['slug']}: wait is only supported for herdr sidequests (backend={m.get('backend')})",
-              file=out)
-        return 2
-    cmd = ["herdr", "agent", "wait", m["slug"], "--until", "done", "--until", "blocked",
-           "--timeout", str(ns.timeout_ms)]
-    res = run(cmd)
-    if res.returncode != 0:
-        print(f"{m['slug']}: wait failed: {(res.stderr or res.stdout).strip()[:300]}", file=out)
-        return 1
+    report = Path(m["report"])
     status = "unknown"
-    try:
-        data = json.loads(res.stdout[res.stdout.find("{"):])
-        status = data.get("result", {}).get("agent", {}).get("agent_status", status)
-    except (ValueError, AttributeError):
-        pass
+    if m.get("backend") == "herdr" and m.get("agent_registered", True):
+        cmd = ["herdr", "agent", "wait", m["slug"], "--until", "done", "--until", "blocked",
+               "--timeout", str(ns.timeout_ms)]
+        res = run(cmd)
+        if res.returncode != 0:
+            print(f"{m['slug']}: wait failed: {(res.stderr or res.stdout).strip()[:300]}", file=out)
+            return 1
+        try:
+            data = json.loads(res.stdout[res.stdout.find("{"):])
+            status = data.get("result", {}).get("agent", {}).get("agent_status", status)
+        except (ValueError, AttributeError):
+            pass
+    else:
+        deadline = clock() + ns.timeout_ms / 1000.0
+        while not report.is_file():
+            if clock() >= deadline:
+                print(f"{m['slug']}: timed out waiting for {report}", file=out)
+                return 1
+            sleep(2.0)
+        status = "reported"
     print(f"{m['slug']}: {status}", file=out)
-    if Path(m["report"]).is_file():
-        print(Path(m["report"]).read_text(), file=out)
+    if report.is_file():
+        print(report.read_text(), file=out)
     else:
         print("(no report written)", file=out)
     return 0

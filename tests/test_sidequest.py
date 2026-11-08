@@ -132,15 +132,17 @@ class SpawnFlow(unittest.TestCase):
         self.assertEqual(meta["cwd"], "/w")
         self.assertIn("[dry-run]", out.getvalue())
 
-    def test_herdr_spawn_splits_and_starts_agent(self):
+    def test_herdr_spawn_splits_starts_agent_then_prompts(self):
         runner = FakeRunner([
             (0, '{"result":{"pane":{"pane_id":"w8:pZ"}}}', ""),
             (0, '{"result":{"type":"ok"}}', ""),
+            (0, '{"result":{"agent":{"agent_status":"working"}}}', ""),
         ])
         meta = sq.spawn(ns(cwd="/w", ratio=0.4, focus=False), env=self.env, run=runner, out=StringIO())
         self.assertEqual(meta["pane_id"], "w8:pZ")
         self.assertEqual(meta["backend"], "herdr")
-        split, start = runner.calls
+        self.assertTrue(meta["agent_registered"])
+        split, start, prompt = runner.calls
         self.assertEqual(split[:3], ["herdr", "pane", "split"])
         self.assertIn("--no-focus", split)
         self.assertIn("0.4", split)
@@ -148,10 +150,22 @@ class SpawnFlow(unittest.TestCase):
         self.assertEqual(start[3], meta["slug"])
         self.assertIn("w8:pZ", start)
         dd = start.index("--")
-        self.assertEqual(start[dd + 1], "--append-system-prompt-file")
-        self.assertTrue(start[-1].startswith("look into the flaky login test\n\n[sidequest "))
-        self.assertIn(meta["report"], start[-1])
+        self.assertEqual(start[dd + 1:], ["--append-system-prompt-file", meta["brief"]])
+        for a in start:
+            self.assertNotIn("\n", a)  # herdr refuses multi-line argv
+        self.assertEqual(prompt[:4], ["herdr", "agent", "prompt", meta["slug"]])
+        self.assertTrue(prompt[4].startswith("look into the flaky login test\n\n[sidequest "))
+        self.assertIn(meta["report"], prompt[4])
         self.assertNotIn("start_fallback", meta)
+
+    def test_herdr_prompt_delivery_failure_exits(self):
+        runner = FakeRunner([
+            (0, '{"result":{"pane":{"pane_id":"w8:pZ"}}}', ""),
+            (0, "", ""),
+            (1, "", "paste failed"),
+        ])
+        with self.assertRaises(SystemExit):
+            sq.spawn(ns(cwd="/w"), env=self.env, run=runner, out=StringIO())
 
     def test_herdr_agent_start_failure_falls_back_to_pane_run(self):
         runner = FakeRunner([
@@ -163,17 +177,19 @@ class SpawnFlow(unittest.TestCase):
         self.assertEqual(runner.calls[2][:3], ["herdr", "pane", "run"])
         self.assertEqual(runner.calls[2][3], "w8:pZ")
         self.assertEqual(runner.calls[2][4], "claude")
+        self.assertTrue(runner.calls[2][-1].startswith("look into the flaky login test\n"))
         self.assertIn("agent not detected", meta["start_fallback"])
+        self.assertFalse(meta["agent_registered"])
 
     def test_herdr_agent_start_retries_while_pane_busy(self):
         busy = '{"error":{"code":"agent_pane_busy","message":"not an available shell"}}'
         runner = FakeRunner([
             (0, '{"result":{"pane":{"pane_id":"w8:pZ"}}}', ""),
-            (1, busy, ""), (1, busy, ""), (0, '{"result":{"type":"ok"}}', ""),
+            (1, busy, ""), (1, busy, ""), (0, '{"result":{"type":"ok"}}', ""), (0, "", ""),
         ])
         slept = []
         meta = sq.spawn(ns(cwd="/w"), env=self.env, run=runner, out=StringIO(), sleep=slept.append)
-        self.assertEqual(len(runner.calls), 4)
+        self.assertEqual(len(runner.calls), 5)
         self.assertEqual(slept, [0.5, 0.5])
         self.assertNotIn("start_fallback", meta)
 
@@ -205,7 +221,7 @@ class SpawnFlow(unittest.TestCase):
         self.assertIn("cd /w && claude --append-system-prompt-file", out.getvalue())
 
     def test_full_mode_forks_parent(self):
-        runner = FakeRunner([(0, '{"result":{"pane":{"pane_id":"w8:pZ"}}}', ""), (0, "", "")])
+        runner = FakeRunner([(0, '{"result":{"pane":{"pane_id":"w8:pZ"}}}', ""), (0, "", ""), (0, "", "")])
         sq.spawn(ns(cwd="/w", mode="full"), env=self.env, run=runner, out=StringIO())
         start = runner.calls[1]
         self.assertIn("--resume", start)
@@ -258,11 +274,31 @@ class SpawnFlow(unittest.TestCase):
         self.assertEqual(runner.calls[0][:4], ["herdr", "agent", "wait", meta["slug"]])
         self.assertIn("--until", runner.calls[0]); self.assertIn("done", runner.calls[0])
         self.assertIn("all good", out.getvalue())
-        # non-herdr backend refuses
+        # non-herdr backend polls for the report file
         env2 = {"SIDEQUEST_STATE_DIR": self.tmp.name}
         m2 = sq.spawn(ns(cwd="/w", backend="print", name="pp"), env=env2, run=FakeRunner([]), out=StringIO())
-        rc = sq.cmd_wait(Namespace(slug="pp", timeout_ms=5), env=env2, out=StringIO(), run=FakeRunner([]))
-        self.assertEqual(rc, 2)
+        ticks = iter([0.0, 1.0, 2.0, 3.0, 99.0])
+        def sleeper(_):
+            Path(m2["report"]).write_text("late but fine\n")
+        out = StringIO()
+        rc = sq.cmd_wait(Namespace(slug="pp", timeout_ms=10000), env=env2, out=out, run=FakeRunner([]),
+                         sleep=sleeper, clock=lambda: next(ticks))
+        self.assertEqual(rc, 0)
+        self.assertIn("late but fine", out.getvalue())
+        # ...and times out when it never appears
+        m3 = sq.spawn(ns(cwd="/w", backend="print", name="qq"), env=env2, run=FakeRunner([]), out=StringIO())
+        ticks = iter([0.0, 5.0, 11.0])
+        rc = sq.cmd_wait(Namespace(slug="qq", timeout_ms=10000), env=env2, out=StringIO(), run=FakeRunner([]),
+                         sleep=lambda s: None, clock=lambda: next(ticks))
+        self.assertEqual(rc, 1)
+        # herdr sidequest that fell back (agent not registered) also polls
+        m4 = sq.spawn(ns(cwd="/w", dry_run=True, name="fb"), env=self.env, run=FakeRunner([]), out=StringIO())
+        mf = Path(m4["brief"]).parent / "meta.json"; d = json.loads(mf.read_text()); d["agent_registered"] = False
+        mf.write_text(json.dumps(d)); Path(m4["report"]).write_text("fb ok\n")
+        out = StringIO()
+        rc = sq.cmd_wait(Namespace(slug="fb", timeout_ms=10), env=self.env, out=out, run=FakeRunner([]),
+                         sleep=lambda s: None, clock=lambda: 0.0)
+        self.assertEqual(rc, 0); self.assertIn("fb ok", out.getvalue())
 
     def test_find_ambiguous_and_missing(self):
         sq.spawn(ns(dry_run=True, name="alpha one"), env=self.env, run=FakeRunner([]), out=StringIO())
