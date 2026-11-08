@@ -75,9 +75,10 @@ that is what `--mode full` is for.
 
 - `sidequest list` — every sidequest, pending vs reported.
 - `sidequest report <slug>` — print the report (exit 1 if none yet).
-- `sidequest wait <slug>` — block until the herdr agent is done/blocked, then
-  print the report. Plain `herdr agent wait` is wrong here: it returns on
-  `idle` while Claude is still bootstrapping.
+- `sidequest wait <slug>` — block until the report file exists, then print
+  it (exit 3 if the herdr agent is `blocked` waiting on the person, 1 on
+  timeout). Do not use `herdr agent wait` for this: `idle` fires while Claude
+  is still booting and `done` is only transient.
 - `sidequest show <slug>` — metadata plus the brief that was sent.
 
 When the user asks "how did the sidequest go", run `sidequest report` for the

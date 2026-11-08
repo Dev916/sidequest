@@ -28,7 +28,7 @@ Inside Claude Code: `/sidequest <request>`. The agent writes a brief and runs:
 sidequest spawn --request "..." --brief brief.md [--mode full] [--name slug]
 sidequest list
 sidequest report <slug>
-sidequest wait <slug>        # herdr: block until done, then print the report
+sidequest wait <slug>        # block until the report exists, then print it
 sidequest show <slug>
 sidequest rm <slug>
 ```

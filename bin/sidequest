@@ -327,41 +327,44 @@ def cmd_show(ns, env=None, out=sys.stdout) -> None:
     print(Path(m["brief"]).read_text(), file=out)
 
 
-def cmd_wait(ns, env=None, out=sys.stdout, run: Runner = _default_runner,
-             sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic) -> int:
-    """Block until the sidequest is done, then print its report.
+def herdr_agent_status(run: Runner, name: str) -> str:
+    res = run(["herdr", "agent", "get", name])
+    if res.returncode != 0:
+        return "unknown"
+    try:
+        data = json.loads(res.stdout[res.stdout.find("{"):])
+        return data.get("result", {}).get("agent", {}).get("agent_status", "unknown")
+    except (ValueError, AttributeError):
+        return "unknown"
 
-    herdr sidequests whose agent registered by name: `herdr agent wait --until
-    done --until blocked` (plain idle fires while claude is still booting).
-    Anything else: poll for report.md until the timeout."""
+
+def cmd_wait(ns, env=None, out=sys.stdout, run: Runner = _default_runner,
+             sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
+             interval: float = 2.0) -> int:
+    """Block until the sidequest has written its report, then print it.
+
+    The report file is the source of truth. herdr's agent states are not
+    reliable for this: `done` is transient and the agent settles on `idle`,
+    so `herdr agent wait --until done` can hang forever. For herdr sidequests
+    we only consult the status to bail out early when the agent is `blocked`
+    (waiting on the person). Exit codes: 0 reported, 1 timeout, 3 blocked."""
     m = find(ns.slug, env)
     report = Path(m["report"])
-    status = "unknown"
-    if m.get("backend") == "herdr" and m.get("agent_registered", True):
-        cmd = ["herdr", "agent", "wait", m["slug"], "--until", "done", "--until", "blocked",
-               "--timeout", str(ns.timeout_ms)]
-        res = run(cmd)
-        if res.returncode != 0:
-            print(f"{m['slug']}: wait failed: {(res.stderr or res.stdout).strip()[:300]}", file=out)
+    herdr_named = m.get("backend") == "herdr" and m.get("agent_registered", True)
+    deadline = clock() + ns.timeout_ms / 1000.0
+    while not report.is_file():
+        if herdr_named:
+            status = herdr_agent_status(run, m["slug"])
+            if status == "blocked":
+                print(f"{m['slug']}: blocked — the sidequest is waiting for input in pane "
+                      f"{m.get('pane_id')}", file=out)
+                return 3
+        if clock() >= deadline:
+            print(f"{m['slug']}: timed out waiting for {report}", file=out)
             return 1
-        try:
-            data = json.loads(res.stdout[res.stdout.find("{"):])
-            status = data.get("result", {}).get("agent", {}).get("agent_status", status)
-        except (ValueError, AttributeError):
-            pass
-    else:
-        deadline = clock() + ns.timeout_ms / 1000.0
-        while not report.is_file():
-            if clock() >= deadline:
-                print(f"{m['slug']}: timed out waiting for {report}", file=out)
-                return 1
-            sleep(2.0)
-        status = "reported"
-    print(f"{m['slug']}: {status}", file=out)
-    if report.is_file():
-        print(report.read_text(), file=out)
-    else:
-        print("(no report written)", file=out)
+        sleep(interval)
+    print(f"{m['slug']}: reported", file=out)
+    print(report.read_text(), file=out)
     return 0
 
 
