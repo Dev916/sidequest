@@ -51,3 +51,8 @@ State: `~/.local/state/sidequest/<slug>/{brief.md,meta.json,report.md}`
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+## License
+
+Public domain under [The Unlicense](LICENSE). Do whatever you want with it.
+No warranty, no liability, no attribution required.
